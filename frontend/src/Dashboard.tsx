@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
-  Area,
-  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
@@ -70,6 +68,18 @@ function formatProbability(value: number | null | undefined) {
   if (value == null) return "—";
   return `${(value * 100).toFixed(1)}%`;
 }
+
+function formatDateTime(timestamp: string | null | undefined) {
+  if (!timestamp) return "Unknown time";
+  return new Date(timestamp).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+const tradePalette = ["#8ab4f8", "#34a853", "#f9ab00", "#f28b82", "#7aa2ff", "#55d09a"];
 
 function sourceState(configured: boolean, items: number): "ok" | "warn" | "no" {
   if (!configured) return "no";
@@ -152,7 +162,7 @@ export default function Dashboard() {
   const advice = advisor.data?.advice;
   const opportunities = advisor.data?.opportunities ?? [];
   const aiPickedMarketId = advice?.recommendations?.[0]?.market_id ?? advisor.data?.simulation?.market_id ?? null;
-  const activeTradeMarketId = simulation.data?.trades?.[0]?.market_id ?? null;
+  const simulationTrades = simulation.data?.trades ?? [];
   const focusMarketId = selectedMarketId ?? aiPickedMarketId ?? opportunities[0]?.market_id ?? null;
   const selectedOpportunity = opportunities.find((item) => item.market_id === focusMarketId) ?? null;
   const primaryRecommendation = advice?.recommendations?.[0] ?? null;
@@ -192,10 +202,13 @@ export default function Dashboard() {
     refetchInterval: 30_000,
   });
 
-  const activeTradeHistory = useQuery({
-    queryKey: ["marketHistory", "active", activeTradeMarketId],
-    queryFn: () => fetchMarketHistory(activeTradeMarketId!),
-    enabled: Boolean(activeTradeMarketId),
+  const simulationTradeHistories = useQuery({
+    queryKey: ["simulationTradeHistories", simulationTrades.map((trade) => trade.market_id).join(",")],
+    queryFn: async () => {
+      const uniqueIds = Array.from(new Set(simulationTrades.map((trade) => trade.market_id)));
+      return Promise.all(uniqueIds.map((marketId) => fetchMarketHistory(marketId, 240)));
+    },
+    enabled: simulationTrades.length > 0,
     refetchInterval: 15_000,
   });
 
@@ -281,11 +294,140 @@ export default function Dashboard() {
     ask: point.best_ask ? point.best_ask * 100 : null,
   }));
 
-  const activeChartData = (activeTradeHistory.data?.points ?? []).map((point) => ({
-    time: formatTime(point.snapshot_at),
-    mid: point.mid_price ? point.mid_price * 100 : null,
-    volume: point.volume_24h,
-  }));
+  const simulationLineDefs = useMemo(
+    () =>
+      simulationTrades.map((trade, index) => ({
+        trade,
+        actualKey: `actual_${trade.market_id}`,
+        projectedKey: `projected_${trade.market_id}`,
+        color: tradePalette[index % tradePalette.length],
+      })),
+    [simulationTrades],
+  );
+
+  const combinedSimulationChartData = useMemo(() => {
+    if (!simulationTrades.length || !simulationTradeHistories.data) return [];
+    const rows = new Map<number, Record<string, number | string | null>>();
+    const startedAt = simulation.data?.started_at ? new Date(simulation.data.started_at).getTime() : null;
+
+    for (const { trade, actualKey, projectedKey } of simulationLineDefs) {
+      const history = simulationTradeHistories.data.find((entry) => entry.market_id === trade.market_id);
+      const points = (history?.points ?? []).filter((point) => {
+        if (!startedAt) return true;
+        return new Date(point.snapshot_at).getTime() >= startedAt;
+      });
+      const usablePoints = points.length > 0 ? points : history?.points ?? [];
+
+      if (!usablePoints.length) {
+        const ts = Date.now();
+        rows.set(ts, {
+          ...(rows.get(ts) ?? { ts, time: formatTime(new Date(ts).toISOString()) }),
+          [actualKey]: trade.mark_price * 100,
+          [projectedKey]: (trade.projected_price ?? trade.entry_price) * 100,
+        });
+        continue;
+      }
+
+      const startProjected = trade.entry_price * 100;
+      const endProjected = (trade.projected_price ?? trade.entry_price) * 100;
+
+      usablePoints.forEach((point, idx) => {
+        const ts = new Date(point.snapshot_at).getTime();
+        const ratio = usablePoints.length <= 1 ? 1 : idx / (usablePoints.length - 1);
+        const projected = startProjected + (endProjected - startProjected) * ratio;
+        const existing = rows.get(ts) ?? { ts, time: formatTime(point.snapshot_at) };
+        existing[actualKey] = point.mid_price != null ? point.mid_price * 100 : null;
+        existing[projectedKey] = projected;
+        rows.set(ts, existing);
+      });
+    }
+
+    return Array.from(rows.values())
+      .sort((a, b) => Number(a.ts ?? 0) - Number(b.ts ?? 0))
+      .map(({ ts, ...rest }) => rest);
+  }, [simulation.data?.started_at, simulationLineDefs, simulationTradeHistories.data, simulationTrades]);
+
+  const simulationNewsFeed = useMemo(() => {
+    const tradeMap = new Map(simulationTrades.map((trade) => [trade.market_id, trade]));
+    const related = opportunities.filter((opportunity) => tradeMap.has(opportunity.market_id));
+    const sourceOpportunities = related.length > 0 ? related : opportunities.slice(0, 3);
+
+    const items: Array<{
+      id: string;
+      source: string;
+      title: string;
+      url?: string;
+      published?: string;
+      detail?: string;
+      marketId: number;
+      marketQuestion: string;
+      edgePct: number;
+      confidencePct: number;
+      iconUrl?: string | null;
+    }> = [];
+
+    for (const opportunity of sourceOpportunities) {
+      const trade = tradeMap.get(opportunity.market_id);
+      const marketQuestion = trade?.question ?? opportunity.question;
+      const iconUrl = trade?.icon_url;
+
+      for (const item of opportunity.research?.google_news ?? []) {
+        items.push({
+          id: `gn-${opportunity.market_id}-${item.link ?? item.title}`,
+          source: item.source || "Google News",
+          title: item.title || "Untitled story",
+          url: item.link,
+          published: item.published,
+          detail: "Signal source: Google News",
+          marketId: opportunity.market_id,
+          marketQuestion,
+          edgePct: opportunity.edge_pct,
+          confidencePct: opportunity.confidence_pct,
+          iconUrl,
+        });
+      }
+
+      for (const item of opportunity.research?.newsapi ?? []) {
+        items.push({
+          id: `na-${opportunity.market_id}-${item.url ?? item.title}`,
+          source: item.source || "News API",
+          title: item.title || "Untitled story",
+          url: item.url,
+          published: item.publishedAt,
+          detail: item.description,
+          marketId: opportunity.market_id,
+          marketQuestion,
+          edgePct: opportunity.edge_pct,
+          confidencePct: opportunity.confidence_pct,
+          iconUrl,
+        });
+      }
+
+      for (const item of opportunity.research?.google_search ?? []) {
+        items.push({
+          id: `ws-${opportunity.market_id}-${item.link ?? item.title}`,
+          source: item.displayLink || "Web Search",
+          title: item.title || "Untitled source",
+          url: item.link,
+          detail: item.snippet,
+          marketId: opportunity.market_id,
+          marketQuestion,
+          edgePct: opportunity.edge_pct,
+          confidencePct: opportunity.confidence_pct,
+          iconUrl,
+        });
+      }
+    }
+
+    return items
+      .slice(0, 30)
+      .sort((a, b) => {
+        const at = a.published ? new Date(a.published).getTime() : 0;
+        const bt = b.published ? new Date(b.published).getTime() : 0;
+        return bt - at;
+      })
+      .slice(0, 12);
+  }, [opportunities, simulationTrades]);
 
   return (
     <div className="app dashboard-app">
@@ -746,14 +888,15 @@ export default function Dashboard() {
           </div>
 
           {simulation.data?.trades && simulation.data.trades.length > 0 ? (
-            <div className="table-wrap">
-              <table>
+            <div className="table-wrap simulation-table-wrap">
+              <table className="simulation-table">
                 <thead>
                   <tr>
                     <th>Market</th>
                     <th>Side</th>
                     <th>Exposure</th>
                     <th>Entry</th>
+                    <th>Projected</th>
                     <th>PnL</th>
                   </tr>
                 </thead>
@@ -761,11 +904,24 @@ export default function Dashboard() {
                   {simulation.data.trades.map((trade) => (
                     <tr key={`${trade.market_id}-${trade.side}-${trade.entry_price}`}>
                       <td className="q-cell" title={trade.question}>
-                        #{trade.market_id} {trade.question}
+                        <div className="trade-market-cell">
+                          {trade.icon_url ? (
+                            <img className="trade-market-icon" src={trade.icon_url} alt="" loading="lazy" />
+                          ) : (
+                            <span className="trade-market-icon fallback">#{trade.market_id}</span>
+                          )}
+                          <span>#{trade.market_id} {trade.question}</span>
+                        </div>
                       </td>
                       <td>{trade.side.toUpperCase()}</td>
                       <td>{formatCurrency(trade.exposure_usd)}</td>
                       <td>{(trade.entry_price * 100).toFixed(1)}%</td>
+                      <td>
+                        {((trade.projected_price ?? trade.entry_price) * 100).toFixed(1)}%
+                        {typeof trade.expected_edge_pct === "number" && (
+                          <div className="bot-live-meta">Edge {formatSignedPercent(trade.expected_edge_pct)}</div>
+                        )}
+                      </td>
                       <td className={trade.pnl_usd >= 0 ? "edge-positive" : "edge-negative"}>
                         {formatCurrency(trade.pnl_usd)}
                         <div className="bot-live-meta">{trade.pnl_pct.toFixed(1)}%</div>
@@ -783,50 +939,179 @@ export default function Dashboard() {
           )}
         </div>
 
-        <div className="card content-card">
-          <div className="feature-header">
+        <div className="card chart-card">
+          <div className="chart-card-header">
             <div>
-              <h2>Signal queue</h2>
-              <p className="chart-subtitle">Recent model outputs and whether they were approved for trading.</p>
+              <h2>All simulation trades</h2>
+              <p className="chart-subtitle">
+                {simulationTrades.length > 0
+                  ? `Actual and projected paths from simulation start across ${simulationTrades.length} trade${simulationTrades.length === 1 ? "" : "s"}.`
+                  : "No active or recent simulation trade is available yet."}
+              </p>
             </div>
+            {simulationTrades.length > 0 && <span className="badge">Live animation</span>}
           </div>
-
-          {signals.data && signals.data.length > 0 ? (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Market</th>
-                    <th>Edge</th>
-                    <th>Confidence</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {signals.data.slice(0, 8).map((signal) => (
-                    <tr key={signal.id}>
-                      <td>#{signal.market_id}</td>
-                      <td className={signal.edge >= 0 ? "edge-positive" : "edge-negative"}>
-                        {(signal.edge * 100).toFixed(1)}%
-                      </td>
-                      <td>{(signal.confidence * 100).toFixed(0)}%</td>
-                      <td>
-                        <span className={`badge ${signal.approved ? "ok" : "no"}`}>
-                          {signal.approved ? "Approved" : signal.rejection_reason ?? "Rejected"}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+          {combinedSimulationChartData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={250}>
+              <LineChart data={combinedSimulationChartData}>
+                <CartesianGrid stroke="#2d3142" strokeDasharray="3 3" />
+                <XAxis dataKey="time" stroke="#9aa0a6" minTickGap={28} />
+                <YAxis stroke="#9aa0a6" unit="%" />
+                <Tooltip />
+                {simulationLineDefs.map((line) => (
+                  <Line
+                    key={line.actualKey}
+                    type="monotone"
+                    dataKey={line.actualKey}
+                    stroke={line.color}
+                    strokeWidth={2.2}
+                    dot={false}
+                    name={`#${line.trade.market_id} actual`}
+                    isAnimationActive
+                    animationDuration={550}
+                  />
+                ))}
+                {simulationLineDefs.map((line) => (
+                  <Line
+                    key={line.projectedKey}
+                    type="monotone"
+                    dataKey={line.projectedKey}
+                    stroke={line.color}
+                    strokeDasharray="6 4"
+                    strokeOpacity={0.7}
+                    strokeWidth={1.4}
+                    dot={false}
+                    name={`#${line.trade.market_id} projected`}
+                    isAnimationActive
+                    animationDuration={550}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
           ) : (
-            <div className="empty-state compact">
-              <strong>No signals yet</strong>
-              <p>Signals will appear after the backend has synced enough market data to score opportunities.</p>
+            <p className="chart-empty">
+              {simulationTradeHistories.isLoading
+                ? "Loading simulation trade history..."
+                : "Once a simulation is running, all tracked trades will appear here in one graph."}
+            </p>
+          )}
+
+          {simulationLineDefs.length > 0 && (
+            <div className="simulation-legend-grid">
+              {simulationLineDefs.map((line) => (
+                <div key={`legend-${line.trade.market_id}`} className="simulation-legend-item">
+                  <span className="legend-swatch" style={{ backgroundColor: line.color }} />
+                  <strong>#{line.trade.market_id}</strong>
+                  <span>{line.trade.side.toUpperCase()}</span>
+                  <span className="bot-live-meta">Entry {(line.trade.entry_price * 100).toFixed(1)}%</span>
+                  <span className="bot-live-meta">Projected {((line.trade.projected_price ?? line.trade.entry_price) * 100).toFixed(1)}%</span>
+                </div>
+              ))}
             </div>
           )}
         </div>
+      </section>
+
+      <section className="card content-card">
+        <div className="feature-header">
+          <div>
+            <h2>Signal queue</h2>
+            <p className="chart-subtitle">Recent model outputs and whether they were approved for trading.</p>
+          </div>
+        </div>
+
+        {signals.data && signals.data.length > 0 ? (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Market</th>
+                  <th>Edge</th>
+                  <th>Confidence</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {signals.data.slice(0, 8).map((signal) => (
+                  <tr key={signal.id}>
+                    <td>#{signal.market_id}</td>
+                    <td className={signal.edge >= 0 ? "edge-positive" : "edge-negative"}>
+                      {(signal.edge * 100).toFixed(1)}%
+                    </td>
+                    <td>{(signal.confidence * 100).toFixed(0)}%</td>
+                    <td>
+                      <span className={`badge ${signal.approved ? "ok" : "no"}`}>
+                        {signal.approved ? "Approved" : signal.rejection_reason ?? "Rejected"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="empty-state compact">
+            <strong>No signals yet</strong>
+            <p>Signals will appear after the backend has synced enough market data to score opportunities.</p>
+          </div>
+        )}
+      </section>
+
+      <section className="card content-card detailed-news-card">
+        <div className="feature-header">
+          <div>
+            <h2>News impacting active bets</h2>
+            <p className="chart-subtitle">
+              Source-level events tied to the markets you are currently trading, with edge and confidence context.
+            </p>
+          </div>
+          <span className="badge">{simulationNewsFeed.length} items</span>
+        </div>
+
+        {simulationNewsFeed.length > 0 ? (
+          <div className="news-impact-list">
+            {simulationNewsFeed.map((item) => (
+              <article key={item.id} className="news-impact-card">
+                <div className="news-impact-head">
+                  {item.iconUrl ? (
+                    <img className="news-impact-icon" src={item.iconUrl} alt="" loading="lazy" />
+                  ) : (
+                    <span className="news-impact-icon fallback">#{item.marketId}</span>
+                  )}
+                  <div>
+                    <span className="badge health-ok">{item.source}</span>
+                    <p className="news-impact-market">Affects #{item.marketId}: {item.marketQuestion}</p>
+                  </div>
+                </div>
+
+                <h3>
+                  {item.url ? (
+                    <a href={item.url} target="_blank" rel="noreferrer">
+                      {item.title}
+                    </a>
+                  ) : (
+                    item.title
+                  )}
+                </h3>
+
+                {item.detail && <p>{item.detail}</p>}
+
+                <div className="news-impact-meta">
+                  <span>{formatDateTime(item.published)}</span>
+                  <span className={item.edgePct >= 0 ? "edge-positive" : "edge-negative"}>
+                    Model edge {formatSignedPercent(item.edgePct)}
+                  </span>
+                  <span>Confidence {item.confidencePct.toFixed(0)}%</span>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state compact">
+            <strong>No linked news yet</strong>
+            <p>Run research or wait for the next analysis cycle to enrich active trades with source-level evidence.</p>
+          </div>
+        )}
       </section>
 
       <details className="detail-section" open={Boolean(selectedOpportunity?.research)}>
@@ -961,37 +1246,6 @@ export default function Dashboard() {
                 {focusHistory.isLoading
                   ? "Loading market history..."
                   : "Not enough order book history is available for the selected market yet."}
-              </p>
-            )}
-          </div>
-
-          <div className="card chart-card">
-            <div className="chart-card-header">
-              <div>
-                <h2>Active simulation market</h2>
-                <p className="chart-subtitle">
-                  {activeTradeMarketId
-                    ? `Latest simulation is tracking #${activeTradeMarketId}`
-                    : "No active or recent simulation trade is available yet."}
-                </p>
-              </div>
-              {activeTradeMarketId && <span className="badge">Simulation focus</span>}
-            </div>
-            {activeChartData.length > 0 ? (
-              <ResponsiveContainer width="100%" height={250}>
-                <AreaChart data={activeChartData}>
-                  <CartesianGrid stroke="#2d3142" strokeDasharray="3 3" />
-                  <XAxis dataKey="time" stroke="#9aa0a6" minTickGap={28} />
-                  <YAxis stroke="#9aa0a6" unit="%" />
-                  <Tooltip />
-                  <Area type="monotone" dataKey="mid" stroke="#8ab4f8" fill="#1e3a5f" strokeWidth={2} name="Mid" />
-                </AreaChart>
-              </ResponsiveContainer>
-            ) : (
-              <p className="chart-empty">
-                {activeTradeHistory.isLoading
-                  ? "Loading simulation market history..."
-                  : "Once a simulation is running, its recent curve will appear here."}
               </p>
             )}
           </div>

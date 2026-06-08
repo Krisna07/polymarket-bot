@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     advisor_research_items_limit: int = 5
     advisor_research_timeout_sec: float = 6.0
     advisor_research_cache_ttl_sec: int = 180
+    advisor_news_max_age_hours: int = 24
 
     sync_markets_interval_sec: int = 60
     snapshot_books_interval_sec: int = 60

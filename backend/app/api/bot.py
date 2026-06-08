@@ -129,6 +129,17 @@ async def _mode_performance(db, mode: str, principal_usd: float) -> dict[str, fl
     }
 
 
+def _market_icon_url(market: Market | None) -> str | None:
+    if not market or not market.raw_metadata:
+        return None
+    raw = market.raw_metadata
+    for key in ("icon", "iconUrl", "image", "imageUrl", "thumbnail"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 async def _prepare_simulation_legs(
     db,
     settings: Settings,
@@ -516,19 +527,39 @@ async def simulation_status(db=Depends(get_db)):
         )
         ob = ob_result.scalar_one_or_none()
 
+        signal_result = await db.execute(
+            select(Signal.edge)
+            .join(Order, Order.signal_id == Signal.id)
+            .where(
+                Order.mode == "simulation",
+                Order.market_id == pos.market_id,
+                Order.signal_id.is_not(None),
+            )
+            .order_by(Order.created_at.desc())
+            .limit(1)
+        )
+        edge = signal_result.scalar_one_or_none()
+
         mark_price = float(ob.mid_price) if ob and ob.mid_price is not None else float(pos.avg_price)
         direction = 1.0 if pos.side == "buy" else -1.0
         pnl = (mark_price - float(pos.avg_price)) * float(pos.size) * direction
         invested += float(pos.exposure_usd)
         current_value += float(pos.exposure_usd) + pnl
 
+        edge_abs = abs(float(edge)) if edge is not None else 0.0
+        projected_price = float(pos.avg_price) * (1.0 + (direction * edge_abs))
+        projected_price = min(0.99, max(0.01, projected_price))
+
         trades.append(
             {
                 "market_id": pos.market_id,
                 "question": market.question if market else f"Market #{pos.market_id}",
+                "icon_url": _market_icon_url(market),
                 "side": pos.side,
                 "entry_price": float(pos.avg_price),
                 "mark_price": mark_price,
+                "projected_price": projected_price,
+                "expected_edge_pct": edge_abs * 100.0,
                 "shares": float(pos.size),
                 "exposure_usd": float(pos.exposure_usd),
                 "pnl_usd": pnl,

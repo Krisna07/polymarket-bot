@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import quote_plus
@@ -131,6 +133,33 @@ class MarketResearchService:
             return []
         return result if isinstance(result, list) else []
 
+    def _parse_timestamp(self, value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = parsedate_to_datetime(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            pass
+
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _is_recent(self, published_at: str | None) -> bool:
+        ts = self._parse_timestamp(published_at)
+        if not ts:
+            return False
+        max_age_hours = max(1, int(self._settings.advisor_news_max_age_hours))
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        return ts >= cutoff
+
     def _extract_keyword(self, question: str, tags: list[str]) -> str:
         tag_candidates = [tag.strip() for tag in tags if isinstance(tag, str) and tag.strip()]
         if tag_candidates:
@@ -147,23 +176,30 @@ class MarketResearchService:
         return " ".join(words[:4])
 
     async def _google_news(self, keyword: str) -> list[dict[str, Any]]:
-        url = f"https://news.google.com/rss/search?q={quote_plus(keyword)}"
+        # Ask Google News for recent items and enforce server-side freshness.
+        query = f"{keyword} when:1d"
+        url = f"https://news.google.com/rss/search?q={quote_plus(query)}"
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             response = await client.get(url)
             response.raise_for_status()
         feed = feedparser.parse(response.text)
         items: list[dict[str, Any]] = []
-        for entry in feed.entries[: self._settings.advisor_research_items_limit]:
+        for entry in feed.entries:
+            published = entry.get("published")
+            if not self._is_recent(published):
+                continue
             items.append(
                 {
                     "title": entry.get("title"),
                     "link": entry.get("link"),
-                    "published": entry.get("published"),
+                    "published": published,
                     "source": getattr(entry.get("source"), "title", None)
                     if entry.get("source")
                     else None,
                 }
             )
+            if len(items) >= self._settings.advisor_research_items_limit:
+                break
         return items
 
     async def _google_search(self, keyword: str) -> list[dict[str, Any]]:
@@ -227,6 +263,9 @@ class MarketResearchService:
         if not self._settings.newsapi_key:
             return await self._bing_news(keyword)
 
+        max_age_hours = max(1, int(self._settings.advisor_news_max_age_hours))
+        from_ts = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(
                 "https://newsapi.org/v2/everything",
@@ -235,6 +274,7 @@ class MarketResearchService:
                     "sortBy": "publishedAt",
                     "pageSize": self._settings.advisor_research_items_limit,
                     "language": "en",
+                    "from": from_ts.isoformat(timespec="seconds"),
                     "apiKey": self._settings.newsapi_key,
                 },
             )
@@ -242,17 +282,25 @@ class MarketResearchService:
             payload = response.json()
 
         articles = payload.get("articles", []) if isinstance(payload, dict) else []
-        return [
-            {
-                "title": article.get("title"),
-                "url": article.get("url"),
-                "publishedAt": article.get("publishedAt"),
-                "source": (article.get("source") or {}).get("name"),
-                "description": article.get("description"),
-            }
-            for article in articles[: self._settings.advisor_research_items_limit]
-            if isinstance(article, dict)
-        ]
+        items: list[dict[str, Any]] = []
+        for article in articles:
+            if not isinstance(article, dict):
+                continue
+            published = article.get("publishedAt")
+            if not self._is_recent(published):
+                continue
+            items.append(
+                {
+                    "title": article.get("title"),
+                    "url": article.get("url"),
+                    "publishedAt": published,
+                    "source": (article.get("source") or {}).get("name"),
+                    "description": article.get("description"),
+                }
+            )
+            if len(items) >= self._settings.advisor_research_items_limit:
+                break
+        return items
 
     async def _bing_news(self, keyword: str) -> list[dict[str, Any]]:
         url = f"https://www.bing.com/news/search?q={quote_plus(keyword)}&format=rss"
@@ -261,16 +309,21 @@ class MarketResearchService:
             response.raise_for_status()
         feed = feedparser.parse(response.text)
         items: list[dict[str, Any]] = []
-        for entry in feed.entries[: self._settings.advisor_research_items_limit]:
+        for entry in feed.entries:
+            published = entry.get("published")
+            if not self._is_recent(published):
+                continue
             items.append(
                 {
                     "title": entry.get("title"),
                     "url": entry.get("link"),
-                    "publishedAt": entry.get("published"),
+                    "publishedAt": published,
                     "source": None,
                     "description": entry.get("summary"),
                 }
             )
+            if len(items) >= self._settings.advisor_research_items_limit:
+                break
         return items
 
     async def _related_polymarket(self, keyword: str) -> list[dict[str, Any]]:

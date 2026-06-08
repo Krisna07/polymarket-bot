@@ -184,9 +184,12 @@ export type MarketHistoryResponse = {
 export type SimulationTrade = {
   market_id: number;
   question: string;
+  icon_url?: string | null;
   side: string;
   entry_price: number;
   mark_price: number;
+  projected_price?: number;
+  expected_edge_pct?: number;
   shares: number;
   exposure_usd: number;
   pnl_usd: number;

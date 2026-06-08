@@ -113,6 +113,8 @@ export default function Dashboard() {
   const [researchInput, setResearchInput] = useState("");
   const [appliedKeyword, setAppliedKeyword] = useState("");
   const [simulationAmount, setSimulationAmount] = useState("100");
+  const [simulationAllocationMode, setSimulationAllocationMode] = useState<"single" | "distributed">("distributed");
+  const [simulationMaxPositions, setSimulationMaxPositions] = useState("3");
   const [runningSimulation, setRunningSimulation] = useState(false);
 
   const advisor = useQuery({
@@ -349,18 +351,37 @@ export default function Dashboard() {
                 placeholder="Simulation amount (USD)"
                 inputMode="decimal"
               />
+              <select
+                className="research-input"
+                value={simulationAllocationMode}
+                onChange={(event) => setSimulationAllocationMode(event.target.value as "single" | "distributed")}
+              >
+                <option value="distributed">Distributed</option>
+                <option value="single">Single</option>
+              </select>
+              <input
+                className="research-input"
+                value={simulationMaxPositions}
+                onChange={(event) => setSimulationMaxPositions(event.target.value)}
+                placeholder="Max positions"
+                inputMode="numeric"
+              />
               <button
                 type="button"
                 className="connect-btn header-btn"
                 disabled={runningSimulation}
                 onClick={async () => {
                   const amount = Number(simulationAmount);
+                  const maxPositions = Number(simulationMaxPositions);
                   if (!Number.isFinite(amount) || amount <= 0) {
+                    return;
+                  }
+                  if (!Number.isFinite(maxPositions) || maxPositions <= 0) {
                     return;
                   }
                   setRunningSimulation(true);
                   try {
-                    await startSimulation(amount);
+                    await startSimulation(amount, undefined, simulationAllocationMode, Math.max(1, Math.floor(maxPositions)));
                     await Promise.all([simulation.refetch(), focusHistory.refetch()]);
                   } finally {
                     setRunningSimulation(false);
@@ -370,7 +391,7 @@ export default function Dashboard() {
                 {runningSimulation ? "Running…" : "Run simulation"}
               </button>
             </div>
-            <p className="control-helper">Creates a paper trade so you can inspect expected outcome and price tracking without deploying live funds.</p>
+            <p className="control-helper">Creates one paper trade or a distributed basket, then tracks each leg without deploying live funds.</p>
             <button
               type="button"
               className="connect-btn secondary header-btn"

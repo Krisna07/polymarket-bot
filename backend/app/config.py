@@ -84,6 +84,19 @@ class Settings(BaseSettings):
     rotation_max_open_trades: int = 2
     rotation_loop_sleep_sec: int = 20
 
+    fast_rotation_rsi_period: int = 7
+    fast_rotation_ema_period: int = 30
+    fast_rotation_volume_lookback: int = 8
+    fast_rotation_volume_multiplier: float = 1.2
+    fast_rotation_capital_fraction: float = 0.01
+    fast_rotation_stop_loss_pct: float = 0.003
+    fast_rotation_take_profit_pct: float = 0.006
+    fast_rotation_daily_drawdown_limit_pct: float = 0.02
+    fast_rotation_max_consecutive_losses: int = 2
+    fast_rotation_pause_hours: int = 1
+    fast_rotation_max_open_trades: int = 4
+    fast_rotation_loop_sleep_sec: int = 10
+
     @property
     def excluded_tag_set(self) -> set[str]:
         return {t.strip().lower() for t in self.excluded_tags.split(",") if t.strip()}

@@ -242,7 +242,12 @@ export function fetchMarketHistory(marketId: number, limit = 60) {
   return fetchJson<MarketHistoryResponse>(`/api/markets/${marketId}/history?limit=${limit}`);
 }
 
-export function startSimulation(amountUsd: number, stopLossPct?: number) {
+export function startSimulation(
+  amountUsd: number,
+  stopLossPct?: number,
+  allocationMode: "single" | "distributed" = "distributed",
+  maxPositions = 3
+) {
   return fetchJson<{
     ok: boolean;
     simulated: boolean;
@@ -253,12 +258,26 @@ export function startSimulation(amountUsd: number, stopLossPct?: number) {
     shares: number;
     principal_usd: number;
     stop_loss_pct?: number | null;
+    allocation_mode?: "single" | "distributed";
+    tracked_positions?: number;
+    legs?: Array<{
+      market_id: number;
+      question: string;
+      side: string;
+      entry_price: number;
+      shares: number;
+      exposure_usd: number;
+      edge: number;
+      score: number;
+    }>;
   }>("/api/bot/simulation/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       amount_usd: amountUsd,
       ...(typeof stopLossPct === "number" ? { stop_loss_pct: stopLossPct } : {}),
+      allocation_mode: allocationMode,
+      max_positions: maxPositions,
     }),
   });
 }

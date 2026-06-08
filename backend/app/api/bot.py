@@ -1,11 +1,12 @@
 import asyncio
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select, text
 
-from backend.app.config import get_settings
+from backend.app.config import Settings, get_settings
 from backend.app.db.models import Market, Order, OrderbookSnapshot, Position, Signal, SimulationSession
 from backend.app.db.session import AsyncSessionLocal
 from backend.app.db.session import get_db
@@ -19,16 +20,40 @@ router = APIRouter()
 # Global variables to manage bot state
 bot_task: asyncio.Task | None = None
 bot_running: bool = False
-bot_runtime: dict = {"last_cycle": None, "rotation": None, "feed": None}
+bot_runtime: dict = {"last_cycle": None, "rotation": None, "feed": None, "strategy_mode": "rotation"}
 
 
 class SimulationStartRequest(BaseModel):
     amount_usd: float = Field(..., gt=0)
     stop_loss_pct: float | None = Field(default=None, gt=0, le=100)
+    allocation_mode: Literal["single", "distributed"] = "distributed"
+    max_positions: int = Field(default=3, ge=1, le=10)
 
 
 class BotStartRequest(BaseModel):
     stop_loss_pct: float | None = Field(default=None, gt=0, le=100)
+    strategy_mode: Literal["rotation", "fast"] = "rotation"
+
+
+def _build_strategy_settings(settings: Settings, strategy_mode: str) -> Settings:
+    profile = settings.model_copy(deep=True)
+    profile.trading_mode = "paper"
+
+    if strategy_mode == "fast":
+        profile.rotation_rsi_period = profile.fast_rotation_rsi_period
+        profile.rotation_ema_period = profile.fast_rotation_ema_period
+        profile.rotation_volume_lookback = profile.fast_rotation_volume_lookback
+        profile.rotation_volume_multiplier = profile.fast_rotation_volume_multiplier
+        profile.rotation_capital_fraction = profile.fast_rotation_capital_fraction
+        profile.rotation_stop_loss_pct = profile.fast_rotation_stop_loss_pct
+        profile.rotation_take_profit_pct = profile.fast_rotation_take_profit_pct
+        profile.rotation_daily_drawdown_limit_pct = profile.fast_rotation_daily_drawdown_limit_pct
+        profile.rotation_max_consecutive_losses = profile.fast_rotation_max_consecutive_losses
+        profile.rotation_pause_hours = profile.fast_rotation_pause_hours
+        profile.rotation_max_open_trades = profile.fast_rotation_max_open_trades
+        profile.rotation_loop_sleep_sec = profile.fast_rotation_loop_sleep_sec
+
+    return profile
 
 
 async def _latest_simulation_session(db) -> SimulationSession | None:
@@ -103,12 +128,127 @@ async def _mode_performance(db, mode: str, principal_usd: float) -> dict[str, fl
         "total_pnl_pct": pnl_pct,
     }
 
-async def run_bot_loop(stop_loss_pct: float | None = None):
-    """Continuously run the rotation strategy loop in paper mode."""
+
+async def _prepare_simulation_legs(
+    db,
+    settings: Settings,
+    opportunities: list[dict],
+    amount_usd: float,
+    allocation_mode: str,
+    max_positions: int,
+) -> list[dict[str, object]]:
+    ranked = [item for item in opportunities if item.get("model_approved")]
+    if not ranked:
+        ranked = opportunities
+
+    if not ranked:
+        return []
+
+    ranked = ranked[:1] if allocation_mode == "single" else ranked[:max_positions]
+    market_ids = [int(item["market_id"]) for item in ranked]
+    markets_result = await db.execute(select(Market).where(Market.id.in_(market_ids)))
+    markets = {market.id: market for market in markets_result.scalars().all()}
+
+    weighted_candidates: list[tuple[dict[str, object], Market, float]] = []
+    for item in ranked:
+        market = markets.get(int(item["market_id"]))
+        if not market or not market.yes_token_id:
+            continue
+        score = max(0.0001, abs(float(item.get("score") or 0.0)))
+        weighted_candidates.append((item, market, score))
+
+    if not weighted_candidates:
+        return []
+
+    if allocation_mode == "single" or len(weighted_candidates) == 1:
+        weights = [1.0]
+    else:
+        weights = [candidate[2] for candidate in weighted_candidates]
+
+    total_weight = sum(weights) or float(len(weighted_candidates))
+    allocations: list[float] = []
+    remaining = float(amount_usd)
+
+    for index, weight in enumerate(weights):
+        if index == len(weights) - 1:
+            allocation = round(max(0.0, remaining), 2)
+        else:
+            allocation = round(float(amount_usd) * (weight / total_weight), 2)
+            allocation = min(allocation, round(max(0.0, remaining), 2))
+        remaining -= allocation
+        allocations.append(allocation)
+
+    legs: list[dict[str, object]] = []
+    for allocation, (item, market, _) in zip(allocations, weighted_candidates):
+        if allocation <= 0:
+            continue
+
+        entry_price = float(item.get("market_probability") or 0.5)
+        entry_price = min(0.99, max(0.01, entry_price))
+        edge = float(item.get("edge") or 0.0)
+        side = "buy" if edge >= 0 else "sell"
+        shares = allocation / entry_price
+        position_size = allocation / max(float(amount_usd), 1.0)
+
+        signal = Signal(
+            market_id=market.id,
+            fair_probability=float(item.get("fair_probability") or entry_price),
+            market_probability=entry_price,
+            edge=edge,
+            confidence=float(item.get("confidence") or 0.0),
+            position_size=position_size,
+            ml_score=float(item.get("score") or 0.0),
+            llm_summary=("simulation entry: top-ranked market" if allocation_mode == "single" else "simulation entry: distributed basket"),
+            approved=True,
+            rejection_reason=None,
+        )
+        db.add(signal)
+        await db.flush()
+
+        db.add(
+            Order(
+                signal_id=signal.id,
+                market_id=market.id,
+                token_id=market.yes_token_id,
+                side=side,
+                price=entry_price,
+                size=shares,
+                status="filled",
+                mode="simulation",
+            )
+        )
+        db.add(
+            Position(
+                market_id=market.id,
+                token_id=market.yes_token_id,
+                side=side,
+                size=shares,
+                avg_price=entry_price,
+                exposure_usd=allocation,
+                mode="simulation",
+            )
+        )
+
+        legs.append(
+            {
+                "market_id": market.id,
+                "question": market.question,
+                "side": side,
+                "entry_price": entry_price,
+                "shares": shares,
+                "exposure_usd": allocation,
+                "edge": edge,
+                "score": float(item.get("score") or 0.0),
+            }
+        )
+
+    return legs
+
+async def run_bot_loop(stop_loss_pct: float | None = None, strategy_mode: str = "rotation"):
+    """Continuously run the selected strategy loop in paper mode."""
     global bot_running, bot_task
     configure_logging()
-    settings = get_settings()
-    settings.trading_mode = "paper"
+    settings = _build_strategy_settings(get_settings(), strategy_mode)
     feed = BinanceKlineFeed(settings) if settings.rotation_use_binance_ws else None
     if feed:
         await feed.start()
@@ -122,6 +262,7 @@ async def run_bot_loop(stop_loss_pct: float | None = None):
                 bot_runtime["rotation"] = trader.status()
                 bot_runtime["feed"] = feed.status() if feed else None
                 bot_runtime["stop_loss_pct"] = stop_loss_pct
+                bot_runtime["strategy_mode"] = strategy_mode
 
                 if stop_loss_pct is not None and settings.bankroll_usd > 0:
                     perf = await _mode_performance(session, mode="paper", principal_usd=settings.bankroll_usd)
@@ -145,18 +286,20 @@ async def start_bot(payload: BotStartRequest | None = None):
     if bot_running:
         raise HTTPException(status_code=400, detail="Bot is already running")
     stop_loss_pct = float(payload.stop_loss_pct) if payload and payload.stop_loss_pct is not None else None
+    strategy_mode = payload.strategy_mode if payload else "rotation"
     bot_runtime = {
         "last_cycle": None,
         "rotation": None,
         "feed": None,
+        "strategy_mode": strategy_mode,
         "stop_loss_pct": stop_loss_pct,
         "performance": None,
         "stop_reason": None,
     }
     # Start the background task
-    bot_task = asyncio.create_task(run_bot_loop(stop_loss_pct=stop_loss_pct))
+    bot_task = asyncio.create_task(run_bot_loop(stop_loss_pct=stop_loss_pct, strategy_mode=strategy_mode))
     bot_running = True
-    return {"status": "started", "stop_loss_pct": stop_loss_pct}
+    return {"status": "started", "stop_loss_pct": stop_loss_pct, "strategy_mode": strategy_mode}
 
 @router.post("/bot/stop")
 async def stop_bot():
@@ -170,7 +313,7 @@ async def stop_bot():
         pass
     bot_running = False
     bot_task = None
-    bot_runtime = {"last_cycle": None, "rotation": None, "feed": None}
+    bot_runtime = {"last_cycle": None, "rotation": None, "feed": None, "strategy_mode": "rotation"}
     return {"status": "stopped"}
 
 @router.get("/bot/status")
@@ -180,6 +323,7 @@ async def bot_status():
         "last_cycle": bot_runtime.get("last_cycle"),
         "rotation": bot_runtime.get("rotation"),
         "feed": bot_runtime.get("feed"),
+        "strategy_mode": bot_runtime.get("strategy_mode"),
         "stop_loss_pct": bot_runtime.get("stop_loss_pct"),
         "performance": bot_runtime.get("performance"),
         "stop_reason": bot_runtime.get("stop_reason"),
@@ -250,23 +394,22 @@ async def start_simulation(
     if not opportunities:
         raise HTTPException(status_code=400, detail="No opportunities available for simulation yet")
 
-    approved = [item for item in opportunities if item.get("model_approved")]
-    target = (approved or opportunities)[0]
-    market_id = int(target["market_id"])
-
-    market_row = await db.execute(select(Market).where(Market.id == market_id).limit(1))
-    market = market_row.scalar_one_or_none()
-    if not market or not market.yes_token_id:
-        raise HTTPException(status_code=400, detail="Selected market is not currently tradable")
-
-    entry_price = float(target.get("market_probability") or 0.5)
-    entry_price = min(0.99, max(0.01, entry_price))
-    side = "buy" if float(target.get("edge") or 0.0) >= 0 else "sell"
-    shares = float(payload.amount_usd) / entry_price
-
     # Keep one clean active simulation session by clearing prior simulated positions/orders.
     await db.execute(delete(Position).where(Position.mode == "simulation"))
     await db.execute(delete(Order).where(Order.mode == "simulation"))
+
+    legs = await _prepare_simulation_legs(
+        db,
+        settings,
+        opportunities,
+        float(payload.amount_usd),
+        payload.allocation_mode,
+        int(payload.max_positions),
+    )
+    if not legs:
+        raise HTTPException(status_code=400, detail="No tradable markets were found for simulation")
+
+    first_leg = legs[0]
 
     active_session = await _active_simulation_session(db)
     if active_session:
@@ -281,41 +424,21 @@ async def start_simulation(
         started_at=datetime.now(timezone.utc),
     )
     db.add(session)
-
-    order = Order(
-        signal_id=None,
-        market_id=market_id,
-        token_id=market.yes_token_id,
-        side=side,
-        price=entry_price,
-        size=shares,
-        status="filled",
-        mode="simulation",
-    )
-    db.add(order)
-    db.add(
-        Position(
-            market_id=market_id,
-            token_id=market.yes_token_id,
-            side=side,
-            size=shares,
-            avg_price=entry_price,
-            exposure_usd=float(payload.amount_usd),
-            mode="simulation",
-        )
-    )
     await db.commit()
 
     return {
         "ok": True,
         "simulated": True,
-        "market_id": market_id,
-        "question": market.question,
-        "side": side,
-        "entry_price": entry_price,
-        "shares": shares,
+        "allocation_mode": payload.allocation_mode,
+        "market_id": int(first_leg["market_id"]),
+        "question": str(first_leg["question"]),
+        "side": str(first_leg["side"]),
+        "entry_price": float(first_leg["entry_price"]),
+        "shares": float(first_leg["shares"]),
         "principal_usd": session.principal_usd,
         "stop_loss_pct": session.max_loss_pct,
+        "legs": legs,
+        "tracked_positions": len(legs),
     }
 
 

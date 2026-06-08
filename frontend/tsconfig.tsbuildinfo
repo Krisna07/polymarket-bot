@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/dashboard.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/components/connectscreen.tsx","./src/config/wagmi.ts","./src/context/authcontext.tsx","./src/lib/api.ts","./src/lib/clobauth.ts","./src/lib/wallet.ts"],"version":"5.6.3"}
